@@ -57,11 +57,13 @@ public class TileDetectorBase implements ITileDetector {
 
     private static final Set<ResourceLocation> swampBiomes = new HashSet<>();
 
-        /**
-     * Cache for combined biome+height identifiers to avoid expensive string parsing in hot loop.
-     * This significantly reduces garbage allocation during chunk scanning.
+    /**
+     * Number of distinct TileHeightType values. Cached once to avoid repeated
+     * values() array allocation (values() allocates a new array every call).
      */
-    private static final Map<String, ResourceLocation> identifierCache = new HashMap<>();
+    private static final int HEIGHT_TYPE_COUNT = TileHeightType.values().length;
+
+    private static final Map<ResourceLocation, ResourceLocation[]> combinedIdCache = new HashMap<>();
 
     /**
      * Scan all registered biomes to mark biomes of certain types that will be
@@ -69,15 +71,16 @@ public class TileDetectorBase implements ITileDetector {
      * (Currently WATER, BEACH and SWAMP)
      */
     public static void scanBiomeTypes(Level level) {
-    	beachBiomes.clear();
-    	waterBiomes.clear();
-    	swampBiomes.clear();
-    	level.registryAccess().registryOrThrow(Registries.BIOME).holders().forEach(biome -> {
-    		if (biome.is(BiomeTags.IS_BEACH)) beachBiomes.add(biome.key().location());
-    		if (biome.is(BiomeTags.IS_RIVER)) waterBiomes.add(biome.key().location());
-    		if (biome.is(BiomeTags.IS_OCEAN)) waterBiomes.add(biome.key().location());
-    		if (biome.is(BiomeTags.HAS_RUINED_PORTAL_SWAMP)) swampBiomes.add(biome.key().location());
-    	});
+        beachBiomes.clear();
+        waterBiomes.clear();
+        swampBiomes.clear();
+        level.registryAccess().registryOrThrow(Registries.BIOME).holders().forEach(biome -> {
+            if (biome.is(BiomeTags.IS_BEACH)) beachBiomes.add(biome.key().location());
+            if (biome.is(BiomeTags.IS_RIVER)) waterBiomes.add(biome.key().location());
+            if (biome.is(BiomeTags.IS_OCEAN)) waterBiomes.add(biome.key().location());
+            if (biome.is(BiomeTags.HAS_RUINED_PORTAL_SWAMP)) swampBiomes.add(biome.key().location());
+        });
+        combinedIdCache.clear();
     }
 
     int priorityForBiome(ResourceLocation biome) {
@@ -123,14 +126,24 @@ public class TileDetectorBase implements ITileDetector {
         return TileHeightType.PEAK;
     }
 
-
     protected static ResourceLocation getBiomeIdentifier(Level world, Biome biome) {
         return world.registryAccess().registryOrThrow(Registries.BIOME).getKey(biome);
     }
 
     protected static ResourceLocation getCombinedBiomeIdentifier(ResourceLocation baseBiome, TileHeightType type) {
-        String key = baseBiome.toString() + "_" + type.getName();
-        return identifierCache.computeIfAbsent(key, k -> new ResourceLocation(baseBiome.getNamespace(), baseBiome.getPath() + "_" + type.getName()));
+        ResourceLocation[] slots = combinedIdCache.get(baseBiome);
+        if (slots == null) {
+            slots = new ResourceLocation[HEIGHT_TYPE_COUNT];
+            combinedIdCache.put(baseBiome, slots);
+        }
+
+        int idx = type.ordinal();
+        ResourceLocation id = slots[idx];
+        if (id == null) {
+            id = new ResourceLocation(baseBiome.getNamespace(), baseBiome.getPath() + "_" + type.getName());
+            slots[idx] = id;
+        }
+        return id;
     }
 
     protected static void updateOccurrencesMap(Map<ResourceLocation, Integer> map, ResourceLocation biome, int weight) {
@@ -158,56 +171,51 @@ public class TileDetectorBase implements ITileDetector {
      */
     @Override
     public ResourceLocation getBiomeID(Level world, ChunkAccess chunk) {
-        Map<ResourceLocation, Integer> biomeOccurrences = new HashMap<>(world.registryAccess().registryOrThrow(Registries.BIOME).keySet().size());
+        Map<ResourceLocation, Integer> biomeOccurrences = new HashMap<>(16);
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        int seaLevel = world.getSeaLevel();
+
+        var heightmap = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.MOTION_BLOCKING);
+
+        boolean scanPonds = AntiqueAtlas.CONFIG.doScanPonds;
+        boolean scanRavines = AntiqueAtlas.CONFIG.doScanRavines;
+        int ravineCutoff = seaLevel - ravineMinDepth;
 
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
-                // biomes seems to be changing with height as well. Let's scan at sea level.
-                Biome biome = chunk.getNoiseBiome(x, world.getSeaLevel(), z).value();
+                Biome biome = chunk.getNoiseBiome(x, seaLevel, z).value();
+                int y = heightmap.getFirstAvailable(x, z);
 
-                // get top block
-                int y = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.MOTION_BLOCKING).getFirstAvailable(x, z);
+                // Compute once per column, reuse for swamp check, priority, and occurrence key.
+                ResourceLocation biomeId = getBiomeIdentifier(world, biome);
 
-
-                //this code runs on the server
-//                ServerChunkManager man = (ServerChunkManager) world.getChunkManager();
-//                MultiNoiseUtil.MultiNoiseSampler sampler = man.getChunkGenerator().getMultiNoiseSampler();
-//                ChunkPos pos = chunk.getPos();
-//                MultiNoiseUtil.NoiseValuePoint sample = sampler.sample(pos.getStartX() + x, y + 10, pos.getStartZ() + z);
-
-//                float m = MultiNoiseUtil.method_38666(sample.weirdnessNoise());
-//                double weirdness = VanillaTerrainParameters.getNormalizedWeirdness(m);
-
-                if (AntiqueAtlas.CONFIG.doScanPonds) {
-                    if (y > 0) {
-                        Block topBlock = chunk.getBlockState(new BlockPos(x, y - 1, z)).getBlock();
-                        // Check if there's surface of water at (x, z), but not swamp
-                        if (topBlock == Blocks.WATER) {
-                            if (swampBiomes.contains(getBiomeIdentifier(world, biome))) {
-                                updateOccurrencesMap(biomeOccurrences, TileIdMap.SWAMP_WATER, priorityWaterPool);
-                            } else {
-                                updateOccurrencesMap(biomeOccurrences, waterPoolBiome, priorityWaterPool);
-                            }
-                        } else if (topBlock == Blocks.LAVA) {
-                            updateOccurrencesMap(biomeOccurrences, TileIdMap.TILE_LAVA, priorityLavaPool);
+                if (scanPonds && y > 0) {
+                    Block topBlock = chunk.getBlockState(pos.set(x, y - 1, z)).getBlock();
+                    if (topBlock == Blocks.WATER) {
+                        if (swampBiomes.contains(biomeId)) {
+                            updateOccurrencesMap(biomeOccurrences, TileIdMap.SWAMP_WATER, priorityWaterPool);
+                        } else {
+                            updateOccurrencesMap(biomeOccurrences, waterPoolBiome, priorityWaterPool);
                         }
+                    } else if (topBlock == Blocks.LAVA) {
+                        updateOccurrencesMap(biomeOccurrences, TileIdMap.TILE_LAVA, priorityLavaPool);
                     }
                 }
 
-                if (AntiqueAtlas.CONFIG.doScanRavines) {
-                    if (y > 0 && y < world.getSeaLevel() - ravineMinDepth) {
-                        updateOccurrencesMap(biomeOccurrences, TileIdMap.TILE_RAVINE, priorityRavine);
-                    }
+                if (scanRavines && y > 0 && y < ravineCutoff) {
+                    updateOccurrencesMap(biomeOccurrences, TileIdMap.TILE_RAVINE, priorityRavine);
                 }
 
-//                updateOccurrencesMap(biomeOccurrences, world, biome, getHeightType(weirdness), priorityForBiome(getBiomeIdentifier(world, biome)));
-                updateOccurrencesMap(biomeOccurrences, world, biome, getHeightTypeFromY(y, world.getSeaLevel()), priorityForBiome(getBiomeIdentifier(world, biome)));
+                ResourceLocation combinedId = getCombinedBiomeIdentifier(biomeId, getHeightTypeFromY(y, seaLevel));
+                int occurrence = biomeOccurrences.getOrDefault(combinedId, 0) + priorityForBiome(biomeId);
+                biomeOccurrences.put(combinedId, occurrence);
             }
         }
 
         if (biomeOccurrences.isEmpty()) return null;
 
-        Map.Entry<ResourceLocation, Integer> meanBiome = Collections.max(biomeOccurrences.entrySet(), Comparator.comparingInt(Map.Entry::getValue));
+        Map.Entry<ResourceLocation, Integer> meanBiome =
+            Collections.max(biomeOccurrences.entrySet(), Comparator.comparingInt(Map.Entry::getValue));
         return meanBiome.getKey();
     }
 }

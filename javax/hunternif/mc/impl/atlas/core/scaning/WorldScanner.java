@@ -7,6 +7,7 @@ import hunternif.mc.impl.atlas.core.ITileStorage;
 import hunternif.mc.impl.atlas.core.TileInfo;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.registry.RegistryKey;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
@@ -48,33 +49,42 @@ public class WorldScanner {
      * @return A set of the new tiles, mostly so the server can sync those with relevant clients.
      */
     public Collection<TileInfo> updateAtlasAroundPlayer(AtlasData data, PlayerEntity player) {
+        World world = player.getEntityWorld();
+
         // Update the actual map only so often:
         int newScanInterval = Math.round(AntiqueAtlasMod.CONFIG.newScanInterval * 20);
 
-        if (player.getEntityWorld().getTime() % newScanInterval != 0) {
+        long worldTime = world.getTime();
+        if (worldTime % newScanInterval != 0) {
             return Collections.emptyList(); //no new tiles
         }
 
         ArrayList<TileInfo> updatedTiles = new ArrayList<>();
 
         int rescanInterval = newScanInterval * AntiqueAtlasMod.CONFIG.rescanRate;
-        boolean rescanRequired = AntiqueAtlasMod.CONFIG.doRescan && player.getEntityWorld().getTime() % rescanInterval == 0;
+        boolean rescanRequired = AntiqueAtlasMod.CONFIG.doRescan && worldTime % rescanInterval == 0;
 
-        ITileDetector biomeDetector = getBiomeDetectorForWorld(player.getEntityWorld().getRegistryKey());
+        RegistryKey<World> dimension = world.getRegistryKey();
+        ITileDetector biomeDetector = getBiomeDetectorForWorld(dimension);
+        ITileStorage storedData = data.getWorldData(dimension);
 
         int scanRadius = biomeDetector.getScanRadius();
+        int scanRadiusSq = scanRadius * scanRadius;
+
+        ChunkPos playerChunkPos = player.getChunkPos();
+        int playerChunkX = playerChunkPos.x;
+        int playerChunkZ = playerChunkPos.z;
 
         // Look at chunks around in a circular area:
         for (int dx = -scanRadius; dx <= scanRadius; dx++) {
-            for (int dz = -scanRadius; dz <= scanRadius; dz++) {
-                if (dx * dx + dz * dz > scanRadius * scanRadius) {
-                    continue; // Outside the circle
-                }
+            int dzMax = (int) Math.sqrt(scanRadiusSq - dx * dx);
+            int chunkX = playerChunkX + dx;
 
-                int chunkX = player.getChunkPos().x + dx;
-                int chunkZ = player.getChunkPos().z + dz;
+            for (int dz = -dzMax; dz <= dzMax; dz++) {
+                int chunkZ = playerChunkZ + dz;
 
-                TileInfo update = updateAtlasForChunk(data, player.getEntityWorld(), chunkX, chunkZ, rescanRequired);
+                TileInfo update = updateAtlasForChunk(data, world, dimension, storedData, biomeDetector,
+                        chunkX, chunkZ, rescanRequired);
                 if (update != null) {
                     updatedTiles.add(update);
                 }
@@ -83,8 +93,9 @@ public class WorldScanner {
         return updatedTiles;
     }
 
-    private TileInfo updateAtlasForChunk(AtlasData data, World world, int x, int z, boolean rescanRequired) {
-        ITileStorage storedData = data.getWorldData(world.getRegistryKey());
+    private TileInfo updateAtlasForChunk(AtlasData data, World world, RegistryKey<World> dimension,
+                                          ITileStorage storedData, ITileDetector biomeDetector,
+                                          int x, int z, boolean rescanRequired) {
         Identifier oldTile = storedData.getTile(x, z);
 
         // Check if there's a custom tile at the location:
@@ -98,8 +109,7 @@ public class WorldScanner {
                 return null;
             }
 
-            if(!world.getChunkManager().isChunkLoaded(x,z))
-            {
+            if (!world.getChunkManager().isChunkLoaded(x, z)) {
                 return null;
             }
 
@@ -111,29 +121,28 @@ public class WorldScanner {
                 return null;
             }
 
-            ITileDetector biomeDetector = getBiomeDetectorForWorld(world.getRegistryKey());
             tile = biomeDetector.getBiomeID(world, chunk);
 
             if (oldTile != null) {
                 if (tile == null) {
                     // If the new tile is empty, remove the old one:
-                    data.removeTile(world.getRegistryKey(), x, z);
+                    data.removeTile(dimension, x, z);
                 } else if (!oldTile.equals(tile)) {
                     // Only update if the old tile's biome ID doesn't match the new one:
-                    data.setTile(world.getRegistryKey(), x, z, tile);
+                    data.setTile(dimension, x, z, tile);
                     return new TileInfo(x, z, tile);
                 }
             } else {
                 // Scanning new chunk:
                 if (tile != null) {
-                    data.setTile(world.getRegistryKey(), x, z, tile);
+                    data.setTile(dimension, x, z, tile);
                     return new TileInfo(x, z, tile);
                 }
             }
         } else {
             // Only update the custom tile if it doesn't rewrite itself:
             if (oldTile == null || !oldTile.equals(tile)) {
-                data.setTile(world.getRegistryKey(), x, z, tile);
+                data.setTile(dimension, x, z, tile);
                 data.markDirty();
                 return new TileInfo(x, z, tile);
             }
