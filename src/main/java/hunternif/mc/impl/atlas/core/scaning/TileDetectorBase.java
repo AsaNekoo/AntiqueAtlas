@@ -57,6 +57,12 @@ public class TileDetectorBase implements ITileDetector {
 
     private static final Set<ResourceLocation> swampBiomes = new HashSet<>();
 
+        /**
+     * Cache for combined biome+height identifiers to avoid expensive string parsing in hot loop.
+     * This significantly reduces garbage allocation during chunk scanning.
+     */
+    private static final Map<String, ResourceLocation> identifierCache = new HashMap<>();
+
     /**
      * Scan all registered biomes to mark biomes of certain types that will be
      * given higher priority when identifying mean biome ID for a chunk.
@@ -122,6 +128,11 @@ public class TileDetectorBase implements ITileDetector {
         return world.registryAccess().registryOrThrow(Registries.BIOME).getKey(biome);
     }
 
+    protected static ResourceLocation getCombinedBiomeIdentifier(ResourceLocation baseBiome, TileHeightType type) {
+        String key = baseBiome.toString() + "_" + type.getName();
+        return identifierCache.computeIfAbsent(key, k -> new ResourceLocation(baseBiome.getNamespace(), baseBiome.getPath() + "_" + type.getName()));
+    }
+
     protected static void updateOccurrencesMap(Map<ResourceLocation, Integer> map, ResourceLocation biome, int weight) {
         int occurrence = map.getOrDefault(biome, 0) + weight;
         map.put(biome, occurrence);
@@ -129,7 +140,7 @@ public class TileDetectorBase implements ITileDetector {
 
     protected static void updateOccurrencesMap(Map<ResourceLocation, Integer> map, Level world, Biome biome, TileHeightType type, int weight) {
         ResourceLocation id = getBiomeIdentifier(world, biome);
-        id = ResourceLocation.tryParse(id.toString() + "_" + type.getName());
+        id = getCombinedBiomeIdentifier(id, type);
 
         int occurrence = map.getOrDefault(id, 0) + weight;
         map.put(id, occurrence);
